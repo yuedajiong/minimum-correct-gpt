@@ -1,16 +1,11 @@
 import torch
-class TpjWorld(torch.utils.data.Dataset):
+
+class Add(torch.utils.data.Dataset):
     def __init__(self, split, ndigit=(2,3)[0]):
         self.ndigit = ndigit
-        number_total, number_valid = (10**self.ndigit)**2, int((10**self.ndigit)**2*0.2)
+        number_total, number_valid = (10**self.ndigit)**2, int((10**self.ndigit)**2 * 0.2)
         permutation = torch.randperm(number_total, generator=torch.Generator())  #generator.manual_seed(122333)  #fixed
         self.indexes = permutation[:number_valid] if split=='valid' else permutation[number_valid:]
-
-    def get_vocab_size(self):
-        return 10  #digits: {0..9}
-
-    def get_block_size(self):
-        return 3*self.ndigit+1-1  #a,b,a+b, and +1 due to potential carry overflow, but then also -1 because very last digit doesn't ever plug back as there is no explicit <EOS> token to predict, it is implied
 
     def __len__(self):
         return self.indexes.nelement()
@@ -30,179 +25,187 @@ class TpjWorld(torch.utils.data.Dataset):
         y[:self.ndigit*2-1] = -1  #only train in the output locations. -1 will mask loss to zero：cross_entropy(..., ignore_index=-1)
         return x, y
 
-class TpjBrain(torch.nn.Module):
-    class Block(torch.nn.Module):
-        class CausalSelfAttention(torch.nn.Module):  #multi-head masked self-attention -> projection
-            def __init__(self, n_embd, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1):
-                super().__init__()
-                self.n_embd = n_embd
-                self.n_head = n_head
-                self.c_attn = torch.nn.Linear(self.n_embd, self.n_embd * 3)
-                self.attn_dropout = torch.nn.Dropout(attn_pdrop)
-                self.c_proj = torch.nn.Linear(self.n_embd, self.n_embd)
-                self.resid_dropout = torch.nn.Dropout(resid_pdrop)
-                self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))  #causal mask to ensure that attention is only applied to the left in the input sequence
+    def get_vocab_size(self):
+        return 10  #digits: {0..9}
 
-            def forward(self, x):
-                B, T, C = x.size()  #batch-size, sequence-length, embedding-dimensionality (n_embd)
-                q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
-                k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  #(B, nh, T, hs)
-                q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  #(B, nh, T, hs)
-                v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  #(B, nh, T, hs)
-                att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1))**0.5)  #causal self-attention; self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-                att = torch.torch.nn.functional.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v  #(B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-                y = y.transpose(1, 2).contiguous().view(B, T, C)  #re-assemble all head outputs side by side
-                y = self.resid_dropout(self.c_proj(y))  #output projection
-                return y
+    def get_block_size(self):
+        return 3*self.ndigit+1-1  #a,b,a+b, and +1 due to potential carry overflow, but then also -1 because very last digit doesn't ever plug back as there is no explicit <EOS> token to predict, it is implied
 
-        class GELU(torch.nn.Module):  #Gaussian Error Linear Units (GELU) https://arxiv.org/abs/1606.08415
-            def forward(self, x):
-                return 0.5 * x * (1.0 + torch.tanh((2.0/torch.pi)**0.5 * (x + 0.044715 * torch.pow(x, 3.0))))
-
-        def __init__(self, n_embd, n_head, block_size, resid_pdrop=0.1):
-            super().__init__()
-            self.ln_1 = torch.nn.LayerNorm(n_embd)
-            self.attn = self.__class__.CausalSelfAttention(n_embd, n_head, block_size, resid_pdrop=resid_pdrop)
-            self.ln_2 = torch.nn.LayerNorm(n_embd)
-            self.mlp = torch.nn.ModuleDict(dict(c_fc=torch.nn.Linear(n_embd, 4 * n_embd), c_proj=torch.nn.Linear(4 * n_embd, n_embd), act=self.__class__.GELU(), dropout=torch.nn.Dropout(resid_pdrop)))
-            self.mlpf = lambda x: self.mlp.dropout(self.mlp.c_proj(self.mlp.act(self.mlp.c_fc(x))))
-
-        def forward(self, x):
-            x = x + self.attn(self.ln_1(x))
-            x = x + self.mlpf(self.ln_2(x))
-            return x
-
-    def __init__(self, vocab_size, block_size, model_type='gpt-nano', n_embd=48, embd_pdrop=0.1, n_layer=3, n_head=3, ):
+class Atte(torch.nn.Module):
+    def __init__(self, d_model, nhead, d_feedforward, batch_first, dropout=0.1, norm_first=True, layer_norm_eps=1e-5, device=None, dtype=None):
         super().__init__()
-        self.block_size = block_size
-        self.transformer = torch.nn.ModuleDict(dict(
-            wte=torch.nn.Embedding(vocab_size, n_embd),
-            wpe=torch.nn.Embedding(block_size, n_embd),
-            drop=torch.nn.Dropout(embd_pdrop),
-            h=torch.nn.ModuleList([self.__class__.Block(n_embd, n_head, block_size) for _ in range(n_layer)]),
-            ln_f=torch.nn.LayerNorm(n_embd)))
-        self.lm_head = torch.nn.Linear(n_embd, vocab_size, bias=False)
-        def init_weights(module):
-            if isinstance(module, torch.nn.Linear):
-                torch.torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    torch.torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, torch.nn.Embedding):
-                torch.torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            elif isinstance(module, torch.nn.LayerNorm):
-                torch.torch.nn.init.zeros_(module.bias)
-                torch.torch.nn.init.ones_(module.weight)
-        self.apply(init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):  #a special scaled init to the residual projections
-                torch.torch.nn.init.normal_(p, mean=0.0, std=0.02/((2 * n_layer)**0.5))
+        self.norm_first = norm_first
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        self.norm1 = torch.nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.mha = torch.nn.modules.activation.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first, **factory_kwargs)
+        self.dropout1 = torch.nn.Dropout(dropout)
+        #
+        if d_feedforward:
+            self.ffw = torch.nn.Sequential(torch.nn.Linear(d_model, d_feedforward), torch.nn.ReLU(), torch.nn.Linear(d_feedforward, d_model))
+            self.dropout2 = torch.nn.Dropout(dropout)
+            self.norm2 = torch.nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
 
-    def forward(self, idx, targets=None):
-        pos = torch.arange(0, idx.size()[1], dtype=torch.long, device=idx.device).unsqueeze(0)  #shape (1, t)
-        tok_emb = self.transformer.wte(idx)  #token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  #position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
+    def forward(self, x, attn_mask=None, key_padding_mask=None):
+        a = x
+        if self.norm_first:
+           a = self.norm1(a)
+        a = self.mha(a, a, a, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)[0]
+        a = self.dropout1(a)
+        o = x + a
+        if not self.norm_first:
+            o = self.norm1(o)
+        #
+        if self.ffw is not None:
+            f = self.ffw(o)
+            f = self.dropout2(f)
+            o = o + f
+            o = self.norm2(o)
+        return o
 
-    def learn(self, idx, targets):
-        logits = self.forward(idx)
-        loss = torch.torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        return logits, loss
+class Embd(torch.nn.Module):
+    def __init__(self, vocab_size, block_size, n_embd, dropout=0.0, device=None, dtype=None):
+        super().__init__()
+        self.wte = torch.nn.Embedding(vocab_size, n_embd).to(device)
+        self.wpe = torch.nn.Embedding(block_size, n_embd).to(device)
+        self.drop = torch.nn.Dropout(dropout)
 
-    def infer(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):  #take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]  #if the sequence context is growing too long we must crop it at block_size
-            logits = self.forward(idx_cond)
-            logits = logits[:, -1, :] / temperature  #pluck the logits at the final step and scale by desired temperature
-            if top_k is not None:  #optionally crop the logits to only the top k options
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = torch.torch.nn.functional.softmax(logits, dim=-1)  #apply softmax to convert logits to (normalized) probabilities
-            if do_sample:  #either sample from the distribution
-                idx_next = torch.multinomial(probs, num_samples=1)
-            else:  #or take the most likely element
-                _, idx_next = torch.topk(probs, k=1, dim=-1)
-            idx = torch.cat((idx, idx_next), dim=1)  #append sampled index to the running sequence and continue
-        return idx
+    def forward(self, idx):
+        if 1:
+            pos = torch.arange(0, idx.size()[1], dtype=torch.long, device=idx.device).unsqueeze(0)  #[0,1,2,3,4,5,]
+            tok_emb = self.wte(idx)
+            pos_emb = self.wpe(pos)
+            o = self.drop(tok_emb + pos_emb)
+            return o
+        elif 0:
+            class PositionalEncoding(nn.Module):
+                def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+                    super().__init__()
+                    self.dropout = nn.Dropout(p=dropout)
+                    position = torch.arange(max_len).unsqueeze(1)
+                    div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+                    pe = torch.zeros(max_len, 1, d_model)
+                    pe[:, 0, 0::2] = torch.sin(position * div_term)
+                    pe[:, 0, 1::2] = torch.cos(position * div_term)
+                    self.register_buffer('pe', pe)
 
-class TpjLearn:
-    def __init__(self, brain, train_dataset, valid_dataset, weight_decay=0.1, betas=(0.9, 0.95)):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.brain = brain.to(self.device)
-        self.train_dataset, self.valid_dataset = train_dataset, valid_dataset
-        no_decay, do_decay = set(), set()
-        for mn, m in brain.named_modules():
-            for pn, p in m.named_parameters():   #named_modules is recursive, use set() to filter
-                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
-                if pn.endswith('bias') or (pn.endswith('weight') and isinstance(m, (torch.torch.nn.LayerNorm, torch.torch.nn.Embedding))):
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, (torch.torch.nn.Linear)):
-                    do_decay.add(fpn)
-        param_dict = {pn: p for pn, p in brain.named_parameters()}
-        optim_groups = [{"params": [param_dict[pn] for pn in sorted(list(do_decay))], "weight_decay": weight_decay}, {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0}]
-        self.optimizer = torch.optim.AdamW(optim_groups, lr=5e-4, betas=betas)  #self.optimizer = torch.optim.AdamW(brain.parameters(), lr=5e-4, betas=betas)
+                def forward(self, x: Tensor) -> Tensor:  #x: [seq_len, batch_size, embedding_dim]
+                    x = x + self.pe[:x.size(0)]
+                    return self.dropout(x)
 
-    def valid(self, dataset):
-        ndigit = self.train_dataset.ndigit
-        results = []
-        factors = torch.tensor([[10**i for i in range(ndigit+1)][::-1]]).to(self.device)
-        loader = torch.utils.data.dataloader.DataLoader(dataset, batch_size=64, num_workers=1, drop_last=False)
-        for b, (x, y) in enumerate(loader):
-            x = x.to(self.device)
-            d1d2 = x[:, :ndigit*2]  #isolate the first two digits of the input sequence alone
-            d1d2d3 = self.brain.infer(d1d2, ndigit+1, do_sample=False) # using greedy argmax, not sampling
-            d3 = d1d2d3[:, -(ndigit+1):]  #isolate the last digit of the sampled sequence
-            d3 = d3.flip(1) #reverse the digits to their "normal" order
-            d1i = (d1d2[:,:ndigit] * factors[:,1:]).sum(1)   # decode the integers from individual digits
-            d2i = (d1d2[:,ndigit:ndigit*2] * factors[:,1:]).sum(1)  # decode the integers from individual digits
-            d3i_pred = (d3 * factors).sum(1)
-            d3i_gt = d1i + d2i #manually calculate the ground truth
-            correct = (d3i_pred == d3i_gt).cpu()
-            for i in range(x.size(0)):
-                results.append(int(correct[i]))
-        rt = torch.tensor(results, dtype=torch.float)
-        print("valid correct: %d/%d = %.2f%%"%(rt.sum(), len(results), 100*rt.mean()))
-        return rt.mean()
+            pos_encoder = PositionalEncoding(d_model, dropout)
+            src = self.pos_encoder(src)
+            return dat
+        else:
+            def position_encoding(seq_len, dim_model, device):
+                pos = torch.arange(seq_len, dtype=torch.float, device=device).reshape(1, -1, 1)
+                dim = torch.arange(dim_model, dtype=torch.float, device=device).reshape(1, 1, -1)
+                phase = pos / (1e4 ** torch.div(dim, dim_model, rounding_mode="floor"))
+                return torch.where(dim.long() % 2 == 0, torch.sin(phase), torch.cos(phase))
+            tok_emb = self.wte(idx)
+            pos_emb = self.wpe(pos)
+            seq_len, dimension = dat.size(1), dat.size(2)
+            dat += position_encoding(seq_len, dimension, device)
+            return dat
 
-    def learn(self, grad_norm_clip=1.0, max_iters=5000):
-        train_loader = torch.utils.data.dataloader.DataLoader(self.train_dataset, batch_size=64, num_workers=1, drop_last=False, pin_memory=True, shuffle=False, sampler=torch.utils.data.RandomSampler(self.train_dataset, replacement=True, num_samples=int(1e10)))
-        top_score = 0.0
-        data_iter = iter(train_loader)
-        for iter_num in range(max_iters):
-            batch = [t.to(self.device) for t in next(data_iter)]
-            x, y = batch
-            logits, self.loss = self.brain.learn(x, y)
-            self.brain.zero_grad(set_to_none=True)
-            self.loss.backward()
-            torch.torch.nn.utils.clip_grad_norm_(self.brain.parameters(), grad_norm_clip)
-            self.optimizer.step()
-            if iter_num % 500 == 0:
-                train_max_batches = {1: None, 2: None, 3: 5}[self.train_dataset.ndigit] # if ndigit=2 we can afford the whole train set, ow no
-                self.brain.eval()
-                with torch.no_grad():
-                    train_score = self.valid(self.train_dataset)
-                    valid_score  = self.valid(self.valid_dataset)
-                score = train_score + valid_score
-                if score > top_score:
-                    top_score = score
-                    print("iter", iter_num, "save model, top score %.4f"%(score))
-                    import os
-                    ckpt_path = os.path.join('./chkp/', "model.pt")
-                    if not os.path.exists(ckpt_path): os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-                    torch.save(self.brain.state_dict(), ckpt_path)
-                self.brain.train()
-                if score==1.0*2: break
+class Task(torch.nn.Module):
+    def __init__(self, n_embd, vocab_size, device=None, dtype=None):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(n_embd)
+        self.head = torch.nn.Linear(n_embd, vocab_size, bias=False)
+
+    def forward(self, out, decode):
+        out = self.norm(out)
+        logits = self.head(out)
+        if not decode:
+            return logits
+        else:
+            probs = torch.torch.nn.functional.softmax(logits, dim=-1)
+            _, idx_next = torch.topk(probs, k=1, dim=-1)
+            idx_next = torch.squeeze(idx_next, dim=-1)
+            return logits, idx_next
+
+class Mind(torch.nn.Module):
+    def __init__(self, vocab_size, block_size, batch_first=True, hidden_dimension=512, nhead=16, device=None):
+        super().__init__()
+        self.embd = Embd(vocab_size=vocab_size, block_size=block_size, n_embd=hidden_dimension).to(device)
+        self.core = Core(d_model=hidden_dimension, nhead=nhead, batch_first=batch_first).to(device)
+        self.task = Task(n_embd=hidden_dimension, vocab_size=vocab_size).to(device)
+
+    def forward(self, I, decode):
+        E = self.embd(I)
+        C = self.core(E)
+        T = self.task(C, decode=decode)
+        return T
+
+def main(pretrain_file=None, checkpoint_file='./temp/ckpt/checkpoint.pth', device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
+    train_dataset_txt = Add('train')
+    valid_dataset_txt = Add('valid')
+ 
+    network = Mind(vocab_size=train_dataset_txt.get_vocab_size(), block_size=train_dataset_txt.get_block_size(), )
+
+    if pretrain_file is not None and os.path.exists(pretrain_file):
+        state_dict = torch.load(pretrain_file)
+        print('load pretrain', pretrain_file)
+    network = network.to(device)
+
+    optimizer = torch.optim.AdamW(network.parameters(), lr=0.001, betas=(0.9,0.999), weight_decay=0.01, eps=1e-08, )
+
+    train_dataloader_txt = torch.utils.data.dataloader.DataLoader(train_dataset_txt, batch_size=32, num_workers=1, drop_last=False, pin_memory=False, collate_fn=None, shuffle=1, sampler=None) 
+    valid_dataloader_txt = torch.utils.data.dataloader.DataLoader(valid_dataset_txt, batch_size=32, num_workers=1, drop_last=False, pin_memory=False, collate_fn=None, shuffle=0, sampler=None)   
+    best_train_loss = None
+    save_train_step = None
+    epochs = 10
+    for epoch in range(epochs):
+        for index, (X,Y) in enumerate(train_dataloader_txt):
+            I = X.to(device)
+            T = Y.to(device)
+  
+            logits = network(I, decode=False)
+
+            loss_txt_predict_next_cross_entropy_logits = torch.torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), T.view(-1), ignore_index=-1)
+            loss = loss_txt_predict_next_cross_entropy_logits
+
+            network.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(network.parameters(), 1.0)
+
+            if best_train_loss is None or loss.item() < best_train_loss:
+                if 0:
+                    if not os.path.exists(checkpoint_file): os.makedirs(os.path.dirname(checkpoint_file), exist_ok=True)
+                    torch.save(network, checkpoint_file)
+                best_train_loss = loss.item()
+                #print("epoch=%06d  index=%06d  loss=%.4f  best_train_loss=%.4f  save checkpoint"%(epoch, index, loss.item(), (-1 if best_train_loss is None else best_train_loss)))
+
+            if 0:
+                if epoch==0 and index==0:
+                    import torchviz  #pip install torchviz
+                    torchviz.make_dot(loss).render(filename="network", directory="./temp/", format="svg", view=False, cleanup=True, quiet=True)
+
+            if (epoch*len(train_dataloader_txt)+index)%100==0: 
+                print('epoch=%06d  index=%06d  loss=%.6f  best_train_loss=%.6f  >>>>'%(epoch, index, loss.item(), (-1 if best_train_loss is None else best_train_loss)))
+
+                if 1:
+                    with torch.no_grad():
+                        network.train()
+                        losses = []
+                        for index, (X,Y) in enumerate(valid_dataloader_txt):
+                            I = X.to(device)
+                            T = Y.to(device)
+                            logits, D = network(I, decode=True)
+                            loss = torch.torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), T.view(-1), ignore_index=-1)
+                            losses.append(loss.item())
+                            if 0:
+                                x0 = I[0].detach().cpu().tolist()
+                                y0 = T[0].detach().cpu().tolist()
+                                d0 = D[0].detach().cpu().tolist()
+                                xx = ''.join([str(int(i)) for i in x0])
+                                yy = ''.join([str(int(i)) for i in y0])
+                                dd = ''.join([str(int(i)) for i in d0])
+                                print(xx+' -> '+' '+yy+' ?= '+dd+'\n')
+                        print('epoch=%06d  losses=%.6f valid'%(epoch, sum(losses)/len(losses)))
+                        network.eval()
 
 if __name__ == '__main__':
-    train_dataset = TpjWorld(split='train')
-    valid_dataset = TpjWorld(split='valid')
-    brain = TpjBrain(train_dataset.get_vocab_size(), train_dataset.get_block_size())
-    learn = TpjLearn(brain, train_dataset, valid_dataset)
-    learn.learn()
+    import signal,os; signal.signal(signal.SIGINT, lambda self,code: os._exit(0))
+    main()
